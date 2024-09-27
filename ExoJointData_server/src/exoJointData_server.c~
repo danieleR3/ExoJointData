@@ -1,0 +1,310 @@
+/*
+ *	exoJointData_server.c
+ *	
+ *	@description	main dell'applicazione SERVER del progetto ExoJointData.
+ *					Gestisce la connessione di due client installati nei giunti
+ *					di un esosceletro. Salva i dati ricevuti dai client in un file
+ *					di log in ordine temporale.
+ *
+ *  @author			Daniele Ronzani - Studente del Corso Magistrale in Ingegneria
+ *										Meccatronica			
+ *	@date			09/01/2015
+ *  @version		1.0	
+ *
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+#include "exoJointData_auxFunction.h"
+#include "exoJointData_thread.h"
+#include "exoJointData_global.h"
+
+//inizializzo le variabili globali
+
+int stop = 0;												 
+pthread_mutex_t mtxStop = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t mtxJointBuf[2]= PTHREAD_MUTEX_INITIALIZER;
+int nPkgBuf[2]={0};
+JointData *jointBuf[2];
+
+pthread_mutex_t mtxSave= PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t okSave = PTHREAD_COND_INITIALIZER;
+int saveStarted=0;
+
+pthread_mutex_t mtxRecv[2]= PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t okRecv = PTHREAD_COND_INITIALIZER;
+
+pthread_mutex_t mtx2Bash= PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t newPkg2Bash = PTHREAD_COND_INITIALIZER;
+JointData pkg2Bash;
+
+pthread_mutex_t mtxCltLogOut = PTHREAD_MUTEX_INITIALIZER;
+int cltLogOut = 0;
+
+int main(int argc, char* argv[])
+{
+	printf("\n****** EXO JOINT DATA: Server Application ******\n\n");
+
+	//dichiaro all'utente che è attiva la modalità di debug
+	//il flag NDEBUG non è definito quando si compila il sorgente
+	//dichiarando la modalità debug nelle opzioni a bash di cmake
+    #ifndef NDEBUG
+       printf("server: DEBUG MODE ON\n");
+    #endif
+
+    if ( argc < 2 ){
+       printf("usage: %s [max_delay_time]\n", argv[0]);
+       printf("max_dealy_time = millisecond delay tolerated\n");
+       exit( -1 );
+    }
+	unsigned int maxDelayTime;
+	sscanf(argv[1], "%u", &(maxDelayTime);
+	if(maxDelayTime <1){
+      	printf("server: error! max_dealy_time must be positive integer\n");
+    	exit(EXIT_FAILURE);
+	}
+	//neutralizzo tutti i segnali in arrivo al main
+	sigset_t sigmask;
+ 	sigfillset(&sigmask); /* initialize set */
+  	if (sigprocmask(SIG_SETMASK, &sigmask, 0) == -1){
+    	printf("error in sigprocmask\n");
+    	exit(EXIT_FAILURE);
+  	}
+
+	//carico le configurazioni di setup
+    char filename[]="../CONFIGURATION.txt";
+    Configuration conf;
+    conf = loadConf(filename); //loadconf() legge, verifica la correttezza e crea struct conf    
+	if(conf.joint1 == NULL){	
+    	printf("error loadConf()\n");
+    	exit(EXIT_FAILURE);
+  	}
+
+	printf("server: configuration loaded successfully\n\n");
+	printf("*****************************************\n");
+    printf("* joint1:\t%s\t\t\t*\n* joint2:\t%s\t\t\t*\n* freqInterp:\t%d\t\t\t*\n* nameLogFile:\t%s\t\t*\n* jointToBash:\t%s\t\t\t*\n*",
+              conf.joint1, conf.joint2, conf.freqInterp, conf.nameLogFile, conf.jointToBash);
+	printf("****************************************\n\n");
+
+	//creazione thread per la gestione della GRADEFUL DEGRADATION
+	pthread_t threadStop_id, threadJointServer_id;
+	int s;	
+	s = pthread_create(&threadStop_id, NULL, threadStopFunc, NULL);
+  	if (s != 0) {
+    	printf("error in pthread_create\n");
+    	exit(EXIT_FAILURE);
+  	}
+	
+	//variabili necessarie per connessione e comunicazione con i client
+	int new_fd, numbytes;
+	unsigned int jointFreq;
+	struct sockaddr_storage their_addr; // connector's address information
+	socklen_t sin_size;
+	char s_ip[INET6_ADDRSTRLEN];
+	sin_size = sizeof their_addr;
+	char response[2], clientGo[]="1", clientStop[]="0", jointInfo[24], jointName[10];
+	char *nameLogFile =(char *)emalloc(strlen(conf.nameLogFile)+4);
+    sprintf(nameLogFile, "../%s", conf.nameLogFile);
+
+	//variabili di configurazione per le thread che ricevono i dati
+	ServerParameter srvParam1, srvParam2;
+	srvParam1.joint = conf.joint1;
+	srvParam2.joint = conf.joint2;
+	srvParam1.sorting = 1;
+	srvParam2.sorting = 1;
+	srvParam1.nameLogFile = nameLogFile;
+	srvParam2.nameLogFile = nameLogFile;
+	srvParam1.printToBash = 0;
+	srvParam2.printToBash = 0;
+
+	int conf_check = 0, already_connect1 =0, already_connect2=0;
+	pthread_t threadPkgRecv1_id,  threadPkgRecv2_id, threadPkgSave_id, threadPrint2Bash_id;
+
+	//inizializzo una connessione server sulla porta PORT
+	int sockfd = socketCreation(PORT);
+
+	//attendo e accetto connessioni finche le configurazione non è verificata
+	while(conf_check<2){
+		printf("server: waiting for connections from joint client...\n");
+
+//		//accetto connessioni entranti e ricevo il nome del client
+		new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
+		if (new_fd == -1) {
+			perror("accept"); 
+	    	exit(1);
+		}
+		inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s_ip, sizeof s_ip);
+
+		//ricevo del client il nome del giunto su cui è installato
+		recvJointPkg(new_fd, jointInfo);
+		sscanf(jointInfo, "%s %u", jointName, &(jointFreq));
+		printf("\nserver: got connection from %s %s\n\n", s_ip, jointName);
+/*<DEBUG>*/	if(DEBUG) printf("\nnserver: %s' sampling rate = %u\n", jointName, jointFreq);
+//
+
+//		//stabilisco che i giunti connessi verifichino la configurazione
+		//in caso affermativo creo thread per la ricezione dei dati
+		if(strcmp(jointName,conf.joint1)==0 && !already_connect1){
+			already_connect1=1;
+			srvParam1.sockfd = new_fd;
+			//imposto la dimensione del buffer in funzione della frequenza
+			//di campionamento e del ritardo massimo tollerato
+			srvParam1.bufSize =(jointFreq*maxDelayTime)/MILLISECONDS+1;
+			//mi proteggo da impostazioni errate di freq e ritardo massimo	
+			if(srvParam1.bufSize<2)
+				srvParam1.bufSize = 2;
+/*DEBUG*/	if(DEBUG) printf("server: size %s's buffer = %u\n", conf.joint1, srvParam1.bufSize);
+
+			if(conf.jointToBash != NULL && strcmp(jointName, conf.jointToBash)==0){
+				srvParam1.printToBash = 1;	//stampa a video i dati di questo giunto
+				//creo la thread che stampa i dati a terminale
+				s = pthread_create(&threadPrint2Bash_id, NULL, threadPrint2Bash, conf.joint1);
+  				if (s != 0) {
+					close(new_fd); 
+    				printf("error in pthread_create\n");
+    				exit(EXIT_FAILURE);
+				}
+			}
+
+
+			//se il secondo giunto non è presente i dati arrivano nell'ordine di invio
+			if(conf.joint2 == NULL){		
+				srvParam1.sorting = 0; //indico che NON c'è bisogno di fare l'ordinamento dei file in arrivo.
+				conf_check=3;		   //esco dal while e non accetto più connessioni
+			}
+			else
+				conf_check++;
+			
+			//creo la thread di ricezione dati passando i parametri di setup
+			s = pthread_create(&threadPkgRecv1_id, NULL, threadPkgRecv, &srvParam1);
+  			if (s != 0) {
+				close(new_fd); 
+    			printf("error in pthread_create\n");
+    			exit(EXIT_FAILURE);
+			}
+		
+  		}
+		else if(!already_connect2 && conf.joint2 != NULL && strcmp(jointName,conf.joint2)==0){ 
+			already_connect2 = 1;
+			srvParam2.sockfd = new_fd;
+			//imposto la dimensione del buffer in funzione della frequenza
+			//di campionamento e del ritardo massimo tollerato
+			srvParam2.bufSize =(jointFreq*maxDelayTime)/MILLISECONDS+1;
+			//mi proteggo da impostazioni errate di freq e ritardo massimo	
+			if(srvParam2.bufSize<2)
+				srvParam2.bufSize = 2;
+/*DEBUG*/	if(DEBUG) printf("server: size %s's buffer = %u\n", conf.joint2, srvParam2.bufSize);
+
+			if(conf.jointToBash != NULL && strcmp(jointName, conf.jointToBash)==0){
+				srvParam2.printToBash = 1;	//stampa a video i dati di questo giunto				
+				//creo la thread che stampa i dati a terminale
+				s = pthread_create(&threadPrint2Bash_id, NULL, threadPrint2Bash, conf.joint2);
+  				if (s != 0) {
+					close(new_fd); 
+    				printf("error in pthread_create\n");
+    				exit(EXIT_FAILURE);
+				}
+			}
+
+			s = pthread_create(&threadPkgRecv2_id, NULL, threadPkgRecv, &srvParam2);
+  			if (s != 0) {
+				close(new_fd); 
+    			printf("error in pthread_create\n");
+    			exit(EXIT_FAILURE);
+			}
+
+			//creazione thread che ordina i dati prima del salvataggio su file log
+			s = pthread_create(&threadPkgSave_id, NULL, threadPkgSave, nameLogFile);
+  			if (s != 0) {
+				close(new_fd); 
+    			printf("error in pthread_create\n");
+    			exit(EXIT_FAILURE);
+			}
+
+			conf_check++;
+  		}
+		else{
+			printf("\nserver: send STOP to %s\n", jointName);
+			//se il giunto connesso non corrisponde a quello atteso dalla configurazione
+			//rispondo deve fermarsi, JOINT client sbagliato
+			if (send(new_fd, clientStop, strlen(clientStop), 0) == -1) 
+				perror("send");
+			close(new_fd); 
+			printf("\nserver: error, joint connected don't check configuration\n");
+		}
+	}
+	//rispondo che può mandarmi i dati
+	if (send(srvParam1.sockfd, clientGo, strlen(clientGo), 0) == -1) 
+		perror("send");
+	if ((conf_check == 2) && (send(srvParam2.sockfd, clientGo, strlen(clientGo), 0) == -1)) 
+			perror("send");
+	if(conf_check == 3) //c'è un solo client connesso
+		printf("server: started receiving data from %s...\n", srvParam1.joint);	
+	if(conf_check == 2) //sono connessi due client
+		printf("server: started receiving data from %s and %s...\n", srvParam1.joint, srvParam2.joint);	
+
+	//attendo che le thread che si occupano della ricezione dei dati terminino
+	s = pthread_join (threadPkgRecv1_id, NULL);
+  	if (s != 0) {
+    	printf("error in pthread_join\n");
+    	exit(EXIT_FAILURE);
+  	}
+	if(conf_check == 2){
+		s = pthread_join (threadPkgRecv2_id, NULL);
+  		if (s != 0) {
+    		printf("error in pthread_join\n");
+    		exit(EXIT_FAILURE);
+  		}
+
+/*<DEBUG>*/	if(DEBUG){
+				printf("\nBEFOR EMPTY: nPkgBuf[ANKLE] = %d, nPkgBuf[KNEE] = %d\n", nPkgBuf[ANKLE], nPkgBuf[KNEE]);
+				int i;
+				for(i=0; i<nPkgBuf[ANKLE]; i++)
+					printf("%u %09lu %f ankle\n", jointBuf[ANKLE][i].sec, jointBuf[ANKLE][i].nanosec, jointBuf[ANKLE][i].value );
+				printf("\n\n");
+				for(i=0; i<nPkgBuf[KNEE]; i++)
+					printf("%u %09lu %f knee\n", jointBuf[KNEE][i].sec, jointBuf[KNEE][i].nanosec, jointBuf[KNEE][i].value );
+/*</DEBUG>*/}
+			//metodo per svuotare i dati ancora presenti nei buffer
+			emptyPkgBuf(nameLogFile);
+
+/*<DEBUG>*/	if(DEBUG){
+			int i;
+			printf("AFTER EMPTY: nPkgBuf[ANKLE] = %d, nPkgBuf[KNEE] = %d\n", nPkgBuf[ANKLE], nPkgBuf[KNEE]);
+			for(i=0; i<nPkgBuf[ANKLE]; i++)
+				printf("%u %09lu %f ankle\n", jointBuf[ANKLE][i].sec, jointBuf[ANKLE][i].nanosec, jointBuf[ANKLE][i].value );
+			printf("\n\n");
+			for(i=0; i<nPkgBuf[KNEE]; i++)
+				printf("%u %09lu %f knee\n", jointBuf[KNEE][i].sec, jointBuf[KNEE][i].nanosec, jointBuf[KNEE][i].value );
+/*</DEBUG>*/	}
+
+		free(jointBuf[ANKLE]);	
+		free(jointBuf[KNEE]);	
+	}
+	printf("\nData stored successfully in %s\n", nameLogFile);
+	printf("\nserver: Press CTRL+C to EXIT\n");
+	free(nameLogFile);
+	close(sockfd);  
+	releaseConf(conf);
+	s = pthread_join (threadStop_id, NULL);
+  	if (s != 0) {
+    	printf("error in pthread_join\n");
+    	exit(EXIT_FAILURE);
+  	}
+	printf("\nserver: exit safe\n");
+    return 0;
+}

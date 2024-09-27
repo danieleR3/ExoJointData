@@ -1,0 +1,202 @@
+/*
+ *	Project ExoJointData - Server Application
+ *
+ *  @author			Daniele Ronzani - Studente del Corso Magistrale in Ingegneria
+ *										Meccatronica			
+ *	@date			09/01/2015
+ *  @version		1.0	
+ *
+ */
+
+
+README per il progetto EXO JOINT DATA
+========================================================
+
+INDICE
+1. Breve introduzione
+2. Note sulla compilazione
+3. Note sull'esecuzione
+4. Specifiche e funzionalità implementate 
+5. Informazioni sul copyright
+
+======================
+1. BREVE INTRODUZIONE
+======================
+
+exoJointData_server è una applicazione progettata per ricevere dati raccolti da uno o due
+sensori distinti, applicati in diversi giunti di un esosceletro per riabilitazione motoria.
+Questa applicazione server riceve i dati secondo un'opportuna codifica contenente dati nel
+protocollo SEC NANOSEC VALUE.
+L'applicazione client che invia i dati fa parte dello stesso progetto software ed è dunque 
+progettata per essere pienamente compatibile con la presente applicazione server.
+
+===========================
+2. NOTE SULLA COMPILAZIONE
+===========================
+Per la compilazione, basterà digitare a terminale (nella directory build/):
+
+$ cmake ..
+
+e di seguito:
+
+$ make
+
+L'eseguibile (exoJointData_server) verrà posizionato nella directory bin/.
+
+In fase di compilazione, è prevista un opzione che permette la visualizzazione 
+di informazioni aggiuntive di debug, durante l'esecuzione del programma.
+
+Per attivare la modalità di debug digitare a terminale (nella directory build/):
+
+$ cmake -DCMAKE_BUILD_TYPE=Debug ..
+
+e di seguito:
+
+$ make
+
+========================
+3. NOTE SULL'ESECUZIONE
+========================
+
+L'applicazione viene eseguita scrivendo a terminale (nella directory bin/):
+
+$ ./exoJointData_server [max_delay_time]
+
+Per la corretta esecuzione del programma richiede che sia specificato un valore appropriato
+per questo parametro in funzione delle frequenze di campionamento dei dati inviati dai client.
+
+Il tempo di ritardo deve essere almeno qualche volta superiore del periodo di campionamento
+più lungo fra i due client. Il buffer altrimenti non sarebbe dimensionato in modo appropriato,
+e verrebbe riempito ancor prima che l'altro client invii il secondo dato, o non sarebbe in ogni 
+caso tollerato alcun ritardo.
+
+
+===========================================
+4. SPECIFICHE E FUNZIONALITA' IMPLEMENTATE 
+===========================================
+
+Le specifiche implementate dall'applicazione sono (in riferimento all'assegnamento
+"Homework Inverno 2015"):
+
+4.1 Comunicazione tra esoscheletro e dispositivo centrale
+	
+	SCELTE DI IMPLEMENTAZIONE:
+	-Per la ricezione dei dati viene inizializzata una apposita thread che riceve i dati dal client.
+
+	-Per l'invio dei dati è stata scelta un opportuna codifica in modo da poter gestire la ricezione
+	tramite il metodo recv(). La codifica scelta è "#__PACCHETTO__\n", dove '#' è il carattere di inizio
+	e '\n' il carattere che identifica la fine del pacchetto.
+	In questo modo è possibile individuare l'inizio e la fine del pacchetto ricevendo byte per byte 
+	senza necessità di conoscere la dimensione del pacchetto.
+
+	-I dati vengono stampati sul file di log con l'ordine di arrivo. Questa sceltà è dettata dall'ASSUNZIONE
+	che i dati vengano inviati in ordine temporale (assunzione verificata dall'applicazione client progettata).
+	Essendo che, per caratteristica della socket stream, i dati arrivano nell'ordine di invio, i dati saranno 
+	dunque stampati in ordine temporale sul file senza necessita di effettuare un ordinamento, e duque senza 
+	alcun bisogno di buffer.
+
+4.2 Lettura da due giunti
+
+	SCELTE DI IMPLEMENTAZIONE:
+
+	-Per la ricezione dei dati vengono inizializzate due thread distinte che fanno capo alla stessa funzione.
+	 La ricezione dei dati avviene tramite due diverse connessioni socket stream con rispettivamente due diversi
+     client.
+
+	-Si è scelto di immagazzinare i dati ricevuti in due buffer distinti. I buffer sono array di strutture che 
+	 definite per contenere SEC NANOSEC VALUE. 
+	 La dimensione dei buffer è calcolata in modo da rispettare un tempo di ritardo massimo MAXLATETIME (macro
+	 definita nell'header exoJointData_global.h). Durante la connessione è dunque richiesto la frequenza di
+	 campionamento, in modo da poter calcolare il numero di campioni che garantisce il ritardo stabilito.
+	 si ASSUME che il tempo massimo di ritardo sia ragionevole, il ritardo massimo deve essere almeno più di due
+	 volte del periodo di campionamento più lungo, altrimenti non è previsto nemmeno il ritardo di un campione.
+	 (si DEVE dunque definire opportunamente il valore [max_delay_time] fornito come parametro al processo).
+
+	-Per il salvataggio dei dati ordinati temporalmente è inizializzata una opportuna tread di salvataggio.
+	 La thread viene aspetta in wait finchè uno dei due buffer si riempie. In questo caso la thread legge dai
+	 buffer, in mutua esclusione, confrontando le teste degli array (i dati più vecchi essendo i buffer ordinati 
+	 temporalmente) e via via salvando su file il dato più vecchio. Questa procedura continua finche uno dei due
+	 buffer si è svuotato. A questo punto le thread di ricezione dati vengono svegliate (attendevano in wait) e 
+	 riprendono a ricevere i dati.
+ 	 Si è scelta questa soluzione, e non l'uso di un buffer circolare, in modo da diminuire in numero di variabili
+	 globali e diminuire il numero di passaggi fra una thread di ricezione e salvataggio. La soluzione sviluppata 
+	 riassume a gruppi le operazioni di salvataggio nel tentativo di ottimizzare il tempo per questa operazione.
+
+4.3 Visualizzazione dati a video
+
+	SCELTE DI IMPLEMENTAZIONE:
+
+	-Per la visualizzazione dei dati del giunto specificato nel file di configurazione, si inizializza una
+	 thread dedicata (come richiesto dalle specifiche).
+	 Come richiesto dalla spiegazione dell'assegnamento in classe, la visualizzazione prevede un sottocapionamento
+	 dei dati è un operazione di media dei dati compresi nel nuovo periodo.
+
+ 	-La thread aspetta in wait l'arrivo di un nuovo dato, comunicato tramite variabile globale dalla thread di ricezione,
+	 accumula il valore dell'angolo e verifica che il valore temporale non ecceda il periodo di sottocapionamento
+	 stabilito dalla macro WAITTIME. Se il dato eccede questo periodo viene finalizzata l'operazione di media e 
+	 viene stampato il dato a terminale.
+	 
+4.4 File di configurazione
+	
+	SCELTE DI IMPLEMENTAZIONE:
+
+	-Per interpretare le informazioni contenute nel file di configurazione si è progettato un apposito metodo
+	 loadconf() che riconosce le informazioni gestendo, per quanto possibile, gli errori dell'utente.
+	
+	-Nel file di configurazioni gli sono tollerati più "spazi bianchi" (spazi, tabulazioni) tra le informazioni 
+	 e più caratteri di fine riga fra le righe.
+
+	-Vi è un controllo sui giunti inseriti e il giunto da visualizzare. 
+	 Vi può essere un giunto singolo ("knee" o "ankle") che può essere o meno indicato come da visualizzare 
+	 nella bash, ma in caso positivo deve essere lo stesso. Altrimenti viene lanciato un errore.
+	 Vi possono essere due giunti ma necessariamente diversi fra loro.
+
+	-La connessione dei client è verificata in modo che venga rispettata la configurazione.
+	 Nel caso di un solo client, l'applicazione inizializza la sola thread di ricezione e non alloca memoria per
+	 i buffer. Ed eventualmente viene inizializzata la thread per la visualizzazione dei dati.
+	 Nel caso di due client, l'ordine di connessione viene reso iniufluente, ma i giunti connessi devono
+	 rispettare il file di configurazione. 
+
+	-Il riconoscimento dei giunti viene fatto tramite una comunicazione tra server e client. Il client dichiara 
+	 al server su che giunto è installato comunicando il suo nome. Il server una volta verificato, comunica al
+	 client se può iniziare ad inviare i dati o se deve fermarsi perchè non è il giunto richiesto.
+
+4.5 Sistema per gradeful degradation.
+
+	SCELTE DI IMPLEMENTAZIONE:
+
+	-La proprietà di gradeful degradation dell'applicazione è gestita neutralizzando l'arrivo dei segnali su
+	 tutte le thread eccetto per una thread progettata ad hoc per gestire il segnale SIGINT. 
+
+	-Questa thread una volta ricevuto il segnale, chiama una funzione di handler che modifica il valore di una variabile globale
+	 stop da 0 a 1. Questa variabile è la condizione nel ciclo while di ripetizione delle altre thread (viene letta
+	 sempre in mutua esclusione tramite un opportuno metodo).
+
+	-Le thread riconosciuto il cambiamento del flag stop, escono dal ciclo e prima di chiamare l'istruzione di return
+	 liberano le risorse impegnate. Viene disallocata la memoria, vengono chiuse le connessioni socket e i file.
+
+	-Nel caso siano connessi due giunti è gestito il salvataggio dei dati finora memorizzati nei buffer. Viene invocato
+	 un opportuno metodo che legge i buffer e li salva ordinatamente nel file di log, fino al loro svuotamento.
+
+	-E' prevista la gestione del logout dei client (nel caso venga chiuso il loro processo con un SIGINT). Vi è una
+	 opportuna variabile globale che notifica alle altre thread il verificarsi di questo evento. In particolare,
+ 	 nel caso siano connessi due client si garantisce che la thread che riceve i dati del client non chiuso, continui
+	 a ricevere e salvare i dati. Grazie alla variabile globale, la thread del client ancora in vita, lancia una procedura
+	 che svuota i buffer salvando i dati in esso contenuti e successivamente cambia la sua configurazione salvando 
+	 direttamente i dati nel file di log senza utilizzare il buffer, come se vi fosse sempre stato un solo client
+	 connesso.
+
+	-Si cerca di garantire la gradeful degradation anche nei confronti di errori riscontrati durante l'esecuzione
+	 del programma.
+     -viene gestito l'errore sul file di configurazione
+	 -viene gestito l'errore su connessione di giunti con nome non coerente alla configurazione
+	 -viene gestita l'errore di ricezione dati da un client
+	 -viene gestito l'errore sul ritardo di un client: quando il ritardo supera il massimo consentito si considera
+	  che il client si sia disconnesso e si gestisce il cambio di configurazione, da due client a uno, come per il
+	  punto precedente.
+
+===================================
+5. INFORMAZIONI SUL COPYRIGHT
+===================================
+Licenza opensurce LGPL
+Ultima versione: 1.00 gennaio 2015

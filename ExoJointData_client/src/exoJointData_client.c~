@@ -1,0 +1,174 @@
+/*
+ *	exoJointData_client.c
+ *	
+ *	@description	main dell'applicazione CLIENT del progetto ExoJointData
+ *					che si occupa di inviare e le misure simulate dell'angolo di 
+ *					un giunti su di un esosceletro per riabilitazione.
+ *
+ *	@param			name = nome del giunto su cui è installato il client
+ *	@param			s = frequenza di campionamento in Hz a cui sono generati i dati
+ *	@param			f = frequenza dell' "onda parabolica" su cui vengono raccolti 
+ *						i campioni
+ *	@param			a = ampiezza dell'onda
+ *
+ *  @author			Daniele Ronzani - Studente del Corso Magistrale in Ingegneria
+ *										Meccatronica			
+ *	@date			09/01/2015
+ *  @version		1.0	
+ *
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+#include <string.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <arpa/inet.h>
+
+#include "exoJointData_auxFunction.h"
+#include "exoJointData_global.h"
+#include "exoJointData_thread.h"
+
+
+//inizializzazione delle variabili globali
+int stop = 0;
+
+pthread_mutex_t mtxStop = PTHREAD_MUTEX_INITIALIZER;
+
+int main(int argc, char* argv[])
+{
+	printf("\n****** EXO JOINT DATA: Client Application ******\n\n");
+
+	//dichiaro all'utente che è attiva la modalità di debug
+	//il flag NDEBUG non è definito quando si compila il sorgente
+	//dichiarando la modalità debug nelle opzioni a bash di cmake
+    #ifndef NDEBUG
+       printf("server: DEBUG MODE ON\n");
+    #endif
+
+
+    if ( argc < 5 ){
+       printf("usage: %s name s f a -option\n", argv[0]);
+       printf("  Generates a joint angle sample.\n");		
+       printf("  name = name of joint.\n");
+       printf("  s = sampling rate\n");
+       printf("  f = parabolic wave frequency\n");
+       printf("  a = amplitude\n"); 
+       exit( -1 );
+    }
+
+    #ifndef NDEBUG
+       printf("client: DEBUG MODE ON\n");
+    #endif
+
+	if(argv[2]<=0){
+		printf("client: error! sampling rate must be integer and positive\n");
+		exit(EXIT_FAILURE);
+	}
+
+	//dichiaro e inizializzo i parametri necessari a settare la
+	//thread che genera e invia i dati
+	ClientParameter cltParam;
+	cltParam.jointName = argv[1];
+	cltParam.sampling_rate = strtod(argv[2], NULL);
+	cltParam.wave_freq = strtod(argv[3], NULL);
+	cltParam.amplitude = strtod(argv[4], NULL);
+	
+	//definisco il pacchetto da inviare al server per dichiarare 
+	//in quale giunto è installato il client e la frequenza di campionamento
+	char jointInfo[24]; //max 10 caratteri per il nome, 1 spazio, 10 cifre unsigned int
+	sprintf(jointInfo, "#%s %u\n", cltParam.jointName, cltParam.sampling_rate );
+/*<DEBUG/>*/	if(DEBUG)	printf("jointName = '%s'\n", jointInfo);
+
+	//neutralizzo tutti i segnali in arrivo al main
+	sigset_t sigmask;
+ 	sigfillset(&sigmask); /* initialize set */
+  	if (sigprocmask(SIG_SETMASK, &sigmask, 0) == -1){
+    	printf("error in sigprocmask\n");
+    	exit(EXIT_FAILURE);
+  	}
+
+	//creo la thread che gestisce il segnale SIGINT (Ctrl+C)
+	//e notifica alle altre thread di fermarsi
+	pthread_t threadStop_id;
+	int s;	
+	s = pthread_create(&threadStop_id, NULL, threadStopFunc, NULL);
+  	if (s != 0) {
+    	printf("error in pthread_create\n");
+    	exit(EXIT_FAILURE);
+  	}
+
+
+	//inizializzo una connessione con HOSTNAME sulla porta PORT
+	cltParam.sockfd  = clientConnection(HOSTNAME, PORT);
+
+	//invio al server un pacchetto che dichiara su che giunto 
+	//è installato il client che sta chiedendo la connessione
+	//e la frequenza di campionamento
+	if (send(cltParam.sockfd, jointInfo, strlen(jointInfo), 0) == -1)
+		perror("send");
+
+/*<DEBUG/>*/	if(DEBUG)printf("client: send joint name '%s' to server\n", jointInfo);
+
+
+	//attendo la risposta del server sulla validità del tentativo
+	//di connessione in base alle configurazioni definite sul server
+	//se il client è installato sul giunto sbagliato verrà ricevuto
+	//STOP e il processo verrà chiuso.
+	int numbytes, client_check;
+	char response[2];
+	if ((numbytes = recv(cltParam.sockfd, response, 1,  0)) == -1) {
+		printf("errore rcv\n");
+	    perror("recv");
+	    exit(1);
+	}
+	response[1]='\0';
+	client_check = atoi(response);
+	if(client_check == STOP){
+		printf("error: joint connected don't check configuration\n");
+		close(cltParam.sockfd);
+   		exit(EXIT_FAILURE);
+	}
+	else if(client_check == OK)
+		printf("client receive authorization to start\n");
+	else{
+		printf("error: invalid respons from server '%s'\n", response);
+   		exit(EXIT_FAILURE);
+	}
+
+	//viene creata la thread che si occupa di generare e inviare i dati
+	pthread_t threadPkgSend_id;
+	s = pthread_create(&threadPkgSend_id, NULL, threadPkgSend, &cltParam);
+	if (s != 0) {
+  		printf("error in pthread_create\n");
+   		exit(EXIT_FAILURE);
+ 	}
+
+	//aspetto che la threadStop termini, in mancanza di errori
+	//ciò accade quando viene ricevuto SIGINT
+	s = pthread_join (threadStop_id, NULL);
+  	if (s != 0) {
+    	printf("error in pthread_join\n");
+    	exit(EXIT_FAILURE);
+  	}
+	
+	//aspetto che threadPkgSend deallochi la memoria, chiuda le connessioni
+	//e termini. In mancanza di errori accade quando riceve da threadStop
+	// la notifica di fermarsi
+	s = pthread_join (threadPkgSend_id, NULL);
+  	if (s != 0) {
+    	printf("error in pthread_join\n");
+    	exit(EXIT_FAILURE);
+  	}
+	printf("\nclient: exit safe\n");
+    return 0;
+}

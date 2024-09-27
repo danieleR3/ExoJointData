@@ -1,0 +1,229 @@
+/*
+ *	exoJointData_threadPkgRecv.c
+ *	
+ *	@description	thread che riceve dati con il protocollo SEC NANOSEC VALUE,
+ *					attraverso una connessione di tipo SOCKET STREAM. 
+ *					Quando è connesso un singolo giunto i dati vengono direttamente
+ *					scritti in ordine temporale su un file di log.
+ *					QUando sono presenti due giunti, i dati vengono memorizzati
+ *					in due buffer. Un uteriore thread si occuperà di leggere da
+ *					questi e salvarli sul file di log. 
+ *  @param			srvParam, struttura di tipo ServerParameter che contiene
+ *					informazioni sulla configurazione del sistema.
+ *					
+ *  @author			Daniele Ronzani - Studente del Corso Magistrale in Ingegneria
+ *										Meccatronica			
+ *	@date			09/01/2015
+ *  @version		1.0	
+ *
+ */
+
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+
+#include "exoJointData_auxFunction.h"
+#include "exoJointData_global.h"
+#include "exoJointData_thread.h"
+
+
+/******************* FUNZIONI AUSILIARIE PER LA RICEZIONE DEI DATI *******************/
+/*
+ *	checkCltLogOut(ServerParameter *srvParam);
+ *	
+ *	@description	funzione che controlla lo stato della variabile globale
+ *					cltLogOut. Se il suo valore è vero (=1) viene chiamata
+ *					la funzione che svuota le code, per riportare il sistema
+ *					alla gestione di un singolo client.
+ *
+ *  @param			srvParam, struttura di tipo ServerParameter che contiene
+ *					informazioni sulla configurazione del sistema.
+ */
+void checkCltLogOut(ServerParameter *srvParam)
+{
+	int client_logout;
+	//mutex per la variabile che notifica il logout di un client
+	epthread_mutex_lock(&mtxCltLogOut);
+
+		client_logout = cltLogOut;	
+	
+	epthread_mutex_unlock(&mtxCltLogOut);
+
+	
+	if(client_logout){
+
+/*<DEBUG>*/	if(DEBUG){
+				printf("\nDEBUG: Client LogOut\n");
+				printf("\nBEFOR EMPTY: nPkgBuf[ANKLE] = %d, nPkgBuf[KNEE] = %d\n", nPkgBuf[ANKLE], nPkgBuf[KNEE]);
+				int i;
+				for(i=0; i<nPkgBuf[ANKLE]; i++)
+				printf("%u %09lu %f ankle\n", jointBuf[ANKLE][i].sec, jointBuf[ANKLE][i].nanosec, jointBuf[ANKLE][i].value );
+				printf("\n");
+				for(i=0; i<nPkgBuf[KNEE]; i++)
+				printf("%u %09lu %f knee\n", jointBuf[KNEE][i].sec, jointBuf[KNEE][i].nanosec, jointBuf[KNEE][i].value );
+/*</DEBUG>*/}
+		//in caso un client si sia disconnesso, svuoto le code
+		emptyPkgBuf((*srvParam).nameLogFile);
+
+/*<DEBUG>*/	if(DEBUG){
+				int i;
+				printf("AFTER EMPTY: nPkgBuf[ANKLE] = %d, nPkgBuf[KNEE] = %d\n", nPkgBuf[ANKLE], nPkgBuf[KNEE]);
+				for(i=0; i<nPkgBuf[ANKLE]; i++)
+					printf("%u %09lu %f ankle\n", jointBuf[ANKLE][i].sec, jointBuf[ANKLE][i].nanosec, jointBuf[ANKLE][i].value );
+				printf("\n");
+				for(i=0; i<nPkgBuf[KNEE]; i++)
+				printf("%u %09lu %f knee\n", jointBuf[KNEE][i].sec, jointBuf[KNEE][i].nanosec, jointBuf[KNEE][i].value );
+/*<DEBUG>*/		}
+		//notifico che non è più necessaria fare l'operazione di 
+		//sorting prima del salvataggio dei dati
+		(*srvParam).sorting = 0;
+		printf("server: keep to receive data from %s...\n", (*srvParam).joint);
+	}	
+}
+
+
+/************************** THREAD DI RICEZIONE DATI DAL CLIENT ***************************/
+void* threadPkgRecv(void *arg) 
+{
+	//casto il puntatore ricevuto dalla thread alla variabile desiderata
+	ServerParameter *srvParam = (ServerParameter *)arg;
+
+	char *jointPkg=(char *)emalloc(MAXDATASIZE*sizeof(char));
+	int numbytes, i = 0, single_joint = 0, buf_id, bufSize;
+    FILE *f;
+	
+	//imposto la dimensione del buffer in funzione della frequenza
+	//di campionamento e del ritardo massimo tollerato
+	bufSize =((*srvParam).sampling_rate*MAXLATETIME)/MILLISECONDS+1;
+/*DEBUG*/	if(DEBUG) printf("server: size %s's buffer = %u\n", (*srvParam).joint, bufSize);
+	//mi proteggo da impostazioni errate di freq e ritardo massimo	
+	if(bufSize<2)
+		bufSize = 2;
+/*DEBUG*/	if(DEBUG) printf("server: size %s's buffer = %u\n", (*srvParam).joint, bufSize);
+
+	//creo il file di log o eventualmente lo resetto
+	if(NULL == (f = fopen((*srvParam).nameLogFile,"w"))){
+        fprintf(stderr,"fopen() failed!\n\n");
+        exit(EXIT_FAILURE);
+    }
+	fclose(f);
+
+	//Alloco e setto il buffer di dati in base al giunto di appartenenza
+	if(strcmp("ankle",(*srvParam).joint)==0)
+		buf_id = ANKLE;
+	else if(strcmp("knee",(*srvParam).joint)==0)
+		buf_id = KNEE;
+
+	//ciclo di ricezione dei dati, termina quando la variabile globale
+	//stop notifica la ricezione del segnale SIGINT	
+	while(!readstop()){
+		//funzione per la ricezione dei dati
+		numbytes = recvJointPkg((*srvParam).sockfd, jointPkg);
+		//controllo il numero di bytes ricevuti e gestisco gli eventuali errori
+    	if (numbytes == 0) { //significa che il client si è disconnesso
+			free(jointPkg);
+	    	printf("server: client %s disconnected\n", (*srvParam).joint);
+			if((*srvParam).printToBash)
+				printf("server: visualization of %s's data stopped\n", (*srvParam).joint);
+			epthread_mutex_lock(&mtxCltLogOut);
+				//notifico che un client si è disconnesso
+				cltLogOut = 1;	
+	
+			epthread_mutex_unlock(&mtxCltLogOut);
+			
+      		return NULL;
+    	}		
+    	else if (numbytes == -1) {
+	    	printf("server: error! pacchetto dati non conforme\n");
+      		return NULL;
+    	}
+
+		//se sto operando con due client controllo che
+		//un client non si sia disconnesso, altrimenti
+		//svuoto le code e modifico i parametri in modo da
+		//lavorare con la modalità client singolo
+		if(single_joint==0)
+			checkCltLogOut(srvParam);
+
+		//se questo è il giunto da visualizzare a video
+		//salvo nella variabile globale il pacchetto
+		//per passarlo alla thread di visualizzazione
+		if((*srvParam).printToBash){
+			epthread_mutex_lock(&mtx2Bash);
+				sscanf(jointPkg, "%u %lu %f", &(pkg2Bash.sec), &(pkg2Bash.nanosec), &(pkg2Bash.value));
+				epthread_cond_signal(&newPkg2Bash);
+			epthread_mutex_unlock(&mtx2Bash);
+		}
+
+		//distinguo se è necessario fare l'ordinamento (2 giunti connessi) o meno (1 solo giunto connesso)		
+		if((*srvParam).sorting){
+			if(i==0)
+				jointBuf[buf_id]=(JointData *)emalloc(bufSize*sizeof(JointData));
+			//mutua esclusione sul buffer
+			epthread_mutex_lock(&mtxJointBuf[buf_id]);
+				sscanf(jointPkg, "%u %lu %f", &(jointBuf[buf_id][nPkgBuf[buf_id]].sec),
+                		&(jointBuf[buf_id][nPkgBuf[buf_id]].nanosec), &(jointBuf[buf_id][nPkgBuf[buf_id]].value));
+				nPkgBuf[buf_id]++;
+
+				//se uno dei buffer è vuoto e l'altro pieno significa che ho superato 
+				//il ritardo massimo per la ricezione dei dati da uno dei giunti
+				if((nPkgBuf[ANKLE]==bufSize && nPkgBuf[KNEE]==0) ||
+						(nPkgBuf[KNEE]==bufSize && nPkgBuf[ANKLE]==0)){
+					printf("error: client not respond\n");
+					free(jointPkg);
+					close((*srvParam).sockfd);
+					if((*srvParam).printToBash)
+						printf("server: visualization of %s's data stopped\n", (*srvParam).joint);
+					epthread_mutex_lock(&mtxCltLogOut);
+						//notifico che un client si è disconnesso
+						cltLogOut = 1;
+					epthread_mutex_unlock(&mtxCltLogOut);
+					return NULL;
+				}
+				//mutex per variabile condizione sul salvataggio
+				epthread_mutex_lock(&mtxSave);
+					if(nPkgBuf[buf_id]==bufSize){
+						saveStarted = 2;
+						epthread_cond_signal(&okSave);
+					}
+				epthread_mutex_unlock(&mtxSave);
+    		epthread_mutex_unlock(&mtxJointBuf[buf_id]);
+
+			//visualizzazione dei dati come DEBUG
+/*DEBUG*/	if(DEBUG) printf("server:\treceived '%s %s'\n",  jointPkg, (*srvParam).joint);
+
+
+			//mutex per variabile condizione che notifica di proseguire con la
+			//ricezione dati dopo salvatagio completato
+			epthread_mutex_lock(&mtxRecv[buf_id]);
+				if(saveStarted > 0)
+					epthread_cond_wait(&okRecv, &mtxRecv[buf_id]);
+			epthread_mutex_unlock(&mtxRecv[buf_id]);
+		}
+		else{ //caso in cui non è necessario fare l'ordinamento (1 solo giunto connesso)
+			if(NULL == (f = fopen((*srvParam).nameLogFile,"a"))){
+        		fprintf(stderr,"fopen() failed!\n\n");
+        		exit(EXIT_FAILURE);
+    		}
+			fprintf(f, "%s %s\n", jointPkg, (*srvParam).joint); 
+
+/*DEBUG*/	if(DEBUG) printf("server:\treceived '%s %s'\n", jointPkg, (*srvParam).joint);
+			single_joint++; //incremento il flag per notificare che sto lavorando a giunto singolo
+			fclose(f);
+		}
+		i++;
+	}
+	//libero le risorse
+	free(jointPkg);
+	close((*srvParam).sockfd); 
+/*DEBUG*/	if(DEBUG)	printf("THREAD RECV %s returned\n", (*srvParam).joint); 
+  	return NULL; 
+}

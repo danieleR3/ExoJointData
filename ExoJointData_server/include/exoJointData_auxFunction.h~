@@ -1,0 +1,206 @@
+/*
+ *	exoJointData_auxFunction.h
+ *	
+ *	@description	header del sorgente exoJointData_auxFunction che raccoglie 
+ *					la definizione delle stutture, enumerazioni e funzioni
+ *					ausiliarie in uso nel progetto ExoJointData 
+ *
+ *  @author			Daniele Ronzani - Studente del Corso Magistrale in Ingegneria
+ *										Meccatronica			
+ *	@date			09/01/2015
+ *  @version		1.0	
+ *
+ */
+
+#ifndef __EJD_AUX__
+#define __EJD_AUX__
+
+/********************************* STRUTTURE ED ENUMERAZIONI *********************************/
+
+/*
+ * pgm: Enumerazione che indica lo stato di lettura del file di configurazione.
+ * @state  JOINT1    		lettura del nome del primo giunto
+ * @state  JOINT2        	lettura nome del secondo giunto
+ * @state  FREQ_INTERP      lettura dellla frequenza di interpolazione
+ * @state  NAME_LOG_FILE   	lettura del nome del file di log 
+ * @state  JOINT2VIDEO      lettura del nome del giunto da visualizzare sulla bash
+ */
+enum conf_param { JOINT1=0, JOINT2, FREQ_INTERP, NAME_LOG_FILE, JOINT2VIDEO};
+
+/* 
+ * Configuration: 	Struttura che definisce i valori dei parametri di configurazioni letti da file
+ * @member 			*joint1, stringa che contiene il nome del primo giunto 
+ * @member 			*joint2, stringa che contiene il nome del secondo giunto
+ * @member 			freqInterp, intero che contiene la frequenza di interpolazione
+ * @member 			*nameLogFile, stringa che contiene il nome del file di log
+ * @member 			*jointToBash, stringa che contiene il nome del giunto da visualizzare sulla bash
+ */
+typedef struct
+{
+    unsigned char *joint1;
+    unsigned char *joint2;
+    unsigned int freqInterp;
+    unsigned char *nameLogFile;
+    unsigned char *jointToBash;
+}Configuration;
+
+
+/* 
+ * ServerParameter: 	Struttura che definisce i valori dei parametri del server
+ * @member 				sockfd, socket file descriptor per la connessione che riceve i dati dal giunto
+ * @member 				sorting, flag intero che indica se è necessario ordinare prima del salvataggio
+ *						ovvero nel caso siano connessi due giunti 
+ * @member 				*joint, stringa che contiene il nome del secondo giunto
+ * @member 				*jointToBash, stringa che contiene il nome del giunto da visualizzare sulla bash
+ * @member 				*nameLogFile, stringa che contiene il nome del file di log
+ * @member				sampling_rate = frequenza di campionamento in Hz a cui sono generati i dati
+ */
+typedef struct
+{
+	int sockfd;
+	int sorting;
+    unsigned char *joint;
+    unsigned char printToBash;
+    unsigned char *nameLogFile;
+    unsigned int sampling_rate;
+}ServerParameter;
+
+/*
+ *	joint: 		Enumerazione che indica a quale giunto si fa riferimento
+ *	@state  	ANKLE = si fa riferimento al giunto della caviglia
+ *	@state  	KNEE  =	si fa riferimento al giunto del ginocchio
+ */
+ enum { ANKLE=0, KNEE} Joint;
+
+/* 
+ * JointData: 	Struttura che definisce un pacchetto di dati proveniente dal sensore un giunto
+ * @member 		sec, intero che definisce i secondi dell'istante di misurazione del campione 
+ * @member 		nanosec, intero che definisce i secondi dell'istante di misurazione del campione
+ * @member 		value, float che definisce il valore dell'angolo misurato
+ */
+typedef struct
+{
+    unsigned int sec;
+    unsigned long int nanosec;
+    float value;
+}JointData;
+
+/********************************* FUNZIONI PER LA LETTURA DEL FILE DI CONFIGURAZIONE *********************************/
+
+/*
+ * endOfLine: Funzione che analizza e riconosce il carattere di fine linea o EOF. 
+ * @param  fin  puntatore a file di cui si vuole identificare il carattere di fine linea o EOF 
+ * @param  c    carattere da analizzare
+ * @return      se carattere è di fine linea o EOF restituisce 1
+ *              se carattere non è di fine linea o EOF restituisce 0 
+ */
+int endOfLine(FILE *fin, int c);
+
+/*
+ * blanckSpace: Funzione che analizza e riconosce gli spazi bianchi.
+ * @param  fin  puntatore a file di cui si vuole identificare uno spazio bianco
+ * @param  c    carattere da analizzare
+ * @return      se carattere è uno spazio bianco restituisce 1
+ *              se carattere non è uno spazio bianco restituisce 0
+ */
+int blanckSpace(FILE *fin, int c);
+
+/* 
+ * createConf: 		Funzione che inizializza una struttura di tipo Configuration
+ * @param 			*joint1, stringa che contiene il nome del primo giunto 
+ * @param 			*joint2, stringa che contiene il nome del secondo giunto
+ * @param 			freqInterp, intero che contiene la frequenza di interpolazione
+ * @param 			*nameLogFile, stringa che contiene il nome del file di log
+ * @param 			*jointToBash, stringa che contiene il nome del giunto da visualizzare sulla bash
+ * @return			conf, struttura inizializzata
+ */
+Configuration createConf(unsigned char *joint1, unsigned char *joint2, unsigned int freqInterp, unsigned char *nameLogFile, unsigned char *jointToBash);
+
+/* 
+ * releaseConf: 	Funzione che libera le risorse allocate dalla struttura di tipo COnfiguration
+ * @param 			conf, struttura di tipo Configuration di cui liberare le risorse 
+ */
+void releaseConf(Configuration conf);
+
+/* 
+ *	loadConf: 	Funzione che legge e ricava le informazioni da un file di configurazione
+ *	@param		*filename, stringa che contiene la path/nome del file di configurazione
+ *	@return		conf, struttura inizializzata contenente i parametri ricavati dal file
+*/
+Configuration loadConf(char *filename);
+
+/*********************** FUNZIONI PER GESTIONE GRADEFUL DEGRADATION *********************************/
+
+/*
+  readstop: 		Funzione che legge in mutua esclusione una variabile globale utilizzata per notificare lo stop a tutte le thread
+  @return			la funzione restituisce il valore della variabile globale stop
+*/
+int readstop();
+
+void emptyPkgBuf(char *nameLogFile);
+/*************************** FUNZIONI PER CONNESSIONE CLIENT TO SERVER ***************************/
+/*
+ *	get_in_addr: 			Funzione che restituisce l'indirizzo internet, IPv4 o IPv6, contenuto nella struttura passata nei parametri.
+ *	@param	*sockaddr	puntatore alla struttura sockaddr 
+ *	@return				la funzione ritorna un indirizzo IPv4 o IPv6.
+ *	Credits: http://beej.us/guide/bgnet/examples/server.c (Beej's Guide to Network Programming)
+ */
+void *get_in_addr(struct sockaddr *sa);
+
+/* 
+ *	socketCreation: 	Funzione che stabilisce una connessione server
+ *	@param	*port		nome della porta a cui ci si vuole connettere
+ *	@return				restituisce il socket file descriptor sockfd della connessione stabilita 
+ *	Credits: http://beej.us/guide/bgnet/examples/client.c (Beej's Guide to Network Programming)
+*/
+int socketCreation(char *port);
+
+
+/* 
+ *	recvJointPkg: 	Funzione che riceve un dato con il protocollo "#_DATO_\n" da una connessione
+ *					socket stream.
+ *	@param			sockfd, socket file descriptor per la connessione che riceve i dati
+ *	@param			*jointPkg, stringa su cui si salva il pacchetto dati ricevuto
+*/
+int recvJointPkg(int sockfd, char* jointPkg);
+
+/*************************** FUNZIONI DI SINTESI GESTIONE DELL'ERRORE ***********************************/
+
+/*
+ * emalloc:		Funzione che alloca dinamicamente n byte di memoria e gestisce l'errore in caso di fallimento della funzione malloc.
+ * @param  		n = numero di byte da allocare dinamicamente
+ * @return      se il metodo malloc ha successo, restituisce un puntatore di tipo void alla memoria allocata dinamicamente
+ *              se il metodo malloc fallisce, lancia l'eccezione di errore
+ */
+void *emalloc( size_t n );
+
+/*
+ * epthread_mutex_lock:		funzione per abbreviare ad una riga la gestione dell'errore alla chiamata
+ *							della funzione pthread_mutex_lock.
+ * @param  					*mutex = puntatore al mutex di cui si vuole fare lock per la mutua esclusione
+ */
+void epthread_mutex_lock( pthread_mutex_t *mutex );
+
+/*
+ * epthread_mutex_unlock:		funzione per abbreviare ad una riga la gestione dell'errore alla chiamata
+ *							della funzione pthread_mutex_unlock.
+ * @param  					*mutex = puntatore al mutex di cui si vuole fare unlock per la mutua esclusione
+ */
+void epthread_mutex_unlock( pthread_mutex_t *mutex );
+
+/*
+ * epthread_cond_signal:	funzione per abbreviare ad una riga la gestione dell'errore alla chiamata
+ *							della funzione pthread_cond_signal.
+ * @param  					*cond = variabile condizione soggetto dell'operazione di signal
+ */
+void epthread_cond_signal(pthread_cond_t *cond);
+
+/*
+ * epthread_cond_wait:		funzione per abbreviare ad una riga la gestione dell'errore alla chiamata
+ *							della funzione pthread_cond_wait.
+ * @param  					*cond = variabile condizione soggetto dell'operazione di signal
+ * @param  					*mutex = puntatore al mutex in cui è protetta l'operazione di wait
+ */
+void epthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex);
+
+#endif
